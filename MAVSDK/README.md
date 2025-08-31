@@ -77,7 +77,7 @@ Create the `logs/` folder if you plan to write logs there, or pass another path 
 1) Start **PX4 SITL** in one terminal:
 ```bash
 cd ~/PX4-Autopilot
-make px4_sitl jmavsim    # or: make px4_sitl gazebo
+make px4_sitl gz_x500    # or: make px4_sitl gazebo
 ```
 
 2) In another terminal, run the teleop:
