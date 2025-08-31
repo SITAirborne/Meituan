@@ -10,6 +10,27 @@ Teleop with wind modes (ideal/random) + stabilizing hold + endurance sims + CSV 
 
 Keys: W/A/S/D (N/W/S/E), R/F (Up/Down), J/L (yaw), SPACE (zero + reset anchor),
       T (arm+takeoff+offboard), B/H (snapshots), G (manual land), Q (quit)
+
+================================================================================
+TUNABLES CHEAT SHEET (edit constants below)
+--------------------------------------------------------------------------------
+• Control / rates:
+    COMMAND_HZ, VEL_STEP_MS, VEL_STEP_UP_MS, YAW_STEP_DEG_S, VEL_MAX_MS
+• Auto-land & timing:
+    LAND_AT_PCT, GUARD_ACTIVATE_GRACE_S, SPEED_FACTOR
+• Hold behavior (fighting wind):
+    HOLD_KP, HOLD_KD, CMD_DEADBAND
+• Wind system:
+    WIND_UPDATE_PERIOD_S, WIND_RANDOM_MAX_MPS, VISUAL_GUSTS, GUST_CMD_GAIN, GUST_BURST_S
+• Power multipliers (how wind/command affect energy burn):
+    WIND_POWER_PER_MPS, K_VEL_POWER
+• Airframe / rotor (mass, props, efficiencies):
+    DRONE_MASS_BATT_KG, N_ROTORS, PROP_DIAM_IN, ETA_PROP, ETA_MOTOR
+• Battery model:
+    N_CELLS, CAP_AH, PACK_IR_OHM, CELL_V_MAX, CELL_V_MIN, P_IDLE_KW
+• Hybrid model:
+    GEN_CONT_KW, GEN_MASS_KG, FUEL_TANK_L, SFC_KG_PER_KWH, FUEL_DENSITY_KG_PER_L
+================================================================================
 """
 
 import asyncio, contextlib, math, random, select, sys, termios, time, tty
@@ -21,40 +42,42 @@ from mavsdk import System
 from mavsdk.offboard import OffboardError, VelocityNedYaw
 
 # -------- General knobs --------
-TAKEOFF_ALT_M      = 5.0
-COMMAND_HZ         = 10.0
-VEL_STEP_MS        = 0.7
-VEL_STEP_UP_MS     = 0.7
-YAW_STEP_DEG_S     = 15.0
-LAND_AT_PCT        = 0.30
-GUARD_ACTIVATE_GRACE_S = 5.0
-SPEED_FACTOR       = 1.0
-K_VEL_POWER        = 0.05   # +5% power per 1 m/s of *user* XY command
+TAKEOFF_ALT_M      = 5.0        # ↑ Takeoff altitude (meters)
+COMMAND_HZ         = 10.0       # ↑ Command publishing rate (Hz) – raise for tighter response
+VEL_STEP_MS        = 0.7        # ↑ How much each keypress changes N/E velocity (m/s)
+VEL_STEP_UP_MS     = 0.7        # ↑ How much each keypress changes Up/Down velocity (m/s) (NED uses +down)
+YAW_STEP_DEG_S     = 15.0       # ↑ Yaw-rate step per keypress (deg/s)
+LAND_AT_PCT        = 0.30       # ↑ Auto-land threshold (0.30 = 30%)
+GUARD_ACTIVATE_GRACE_S = 5.0    # ↑ Seconds after OFFBOARD before auto-land guard is armed
+SPEED_FACTOR       = 1.0        # ↑ Simulation speed for energy/fuel models (1.0 = realtime)
+K_VEL_POWER        = 0.05       # ↑ +5% power per 1 m/s of *user* XY command (tilt proxy)
 
 # Wind → power multiplier (applies in both battery & hybrid)
-WIND_POWER_PER_MPS     = 0.02
-WIND_UPDATE_PERIOD_S   = 5.0
-WIND_RANDOM_MAX_MPS    = 20.0
+WIND_POWER_PER_MPS     = 0.02   # ↑ +2% power per 1 m/s ambient wind; raise if you want bigger wind penalty
+WIND_UPDATE_PERIOD_S   = 5.0    # ↑ Random wind re-roll cadence (seconds)
+WIND_RANDOM_MAX_MPS    = 20.0   # ↑ Max random wind speed (m/s)
 
 # ---- Visual gusts + hold (to see the shove & recovery even if SITL wind=0) ----
-VISUAL_GUSTS = True       # change if don't want see the gust
-GUST_CMD_GAIN = 0.20      # only 20% of wind speed is used as a commanded nudge
-GUST_BURST_S  = 1.0       # shove lasts 1 s after each wind change
-HOLD_KP = 0.8             # stronger hold to fight the shove
-HOLD_KD = 1.2
-CMD_DEADBAND = 0.08       # below this, we treat as hover (enable hold)
-VEL_MAX_MS = 3.0          # clamp final XY command so it can’t run away
+VISUAL_GUSTS = True       # ↑ False to disable the brief visible shove when wind changes
+GUST_CMD_GAIN = 0.20      # ↑ Fraction of wind injected as a 1s command nudge (0..~0.5)
+GUST_BURST_S  = 1.0       # ↑ Duration of visual gust shove (seconds)
+HOLD_KP = 0.8             # ↑ Position-hold P gain (increase to fight wind harder; too high jitters)
+HOLD_KD = 1.2             # ↑ Position-hold D gain (damping; raise if oscillatory)
+CMD_DEADBAND = 0.08       # ↑ Below this |XY| command, we engage hold (treat as hover)
+VEL_MAX_MS = 3.0          # ↑ Clamp XY command magnitude to keep it controllable
 
 # -------- Weather / wind --------
 @dataclass
 class Weather:
     wind_mode: str          # "ideal" or "random"
-    wind_speed_mps: float
+    wind_speed_mps: float   # current wind speed (m/s)
     wind_dir_deg: float     # TO direction (0=N, 90=E)
-    rho: float              # kg/m^3
+    rho: float              # air density kg/m^3
     gust_expire_ts: float = 0.0  # internal: when the brief nudge ends
 
 def isa_density(temp_C: float, pressure_alt_m: float) -> float:
+    # ↑ Use this if you want non-standard day density (e.g., hot & high):
+    #   rho = isa_density(temp_C=35.0, pressure_alt_m=1500.0)
     T0,P0,L,g,R = 288.15,101325.0,0.0065,9.80665,287.05
     h = max(0.0, pressure_alt_m)
     P = P0 * (1.0 - L*h/T0) ** (g/(R*L))
@@ -62,10 +85,10 @@ def isa_density(temp_C: float, pressure_alt_m: float) -> float:
     return P / (R * T)
 
 # -------- Airframe / rotor --------
-ETA_PROP, ETA_MOTOR = 0.75, 0.90
+ETA_PROP, ETA_MOTOR = 0.75, 0.90  # ↑ Efficiencies (lower = more electrical power needed)
 ETA_TOTAL = ETA_PROP * ETA_MOTOR
-N_ROTORS = 4
-PROP_DIAM_IN = 40.0
+N_ROTORS = 4                       # ↑ Number of rotors
+PROP_DIAM_IN = 40.0                # ↑ Prop diameter (inches)
 PROP_DIAM_M  = PROP_DIAM_IN * 0.0254
 
 def hover_mech_power_disk(mass_kg: float, rho: float) -> float:
@@ -78,14 +101,14 @@ def hover_electrical_kW(mass_kg: float, rho: float) -> float:
     return hover_mech_power_disk(mass_kg, rho) / max(1e-6, ETA_TOTAL) / 1000.0
 
 # -------- Battery model (24S 34Ah, U15II) --------
-N_CELLS, CAP_AH, CELL_V_NOM = 24, 34.0, 3.7
+N_CELLS, CAP_AH, CELL_V_NOM = 24, 34.0, 3.7   # ↑ Pack sizing (cells, capacity, nominal V)
 PACK_KWH = (N_CELLS * CELL_V_NOM * CAP_AH) / 1000.0
-CELL_V_MAX, CELL_V_MIN = 4.10, 3.30
-PACK_IR_OHM = 0.03
-DRONE_MASS_BATT_KG = 80.0
-P_IDLE_KW = 0.15
-PER_MOTOR_POWER_CAP_W = None
-PER_MOTOR_CURRENT_CAP = None
+CELL_V_MAX, CELL_V_MIN = 4.10, 3.30          # ↑ OCV endpoints (full/empty)
+PACK_IR_OHM = 0.03                            # ↑ Pack internal resistance (higher = more sag under load)
+DRONE_MASS_BATT_KG = 80.0                     # ↑ AUW for battery configuration (kg)  << MASS >>
+P_IDLE_KW = 0.15                              # ↑ Idle draw when on ground / not in offboard (kW)
+PER_MOTOR_POWER_CAP_W = None                  # ↑ e.g., 3000.0 to cap power; None disables
+PER_MOTOR_CURRENT_CAP = None                  # ↑ e.g., 120.0 A per motor; None disables
 
 def ocv_from_soc(soc: float) -> float:
     soc = max(0.0, min(1.0, soc))
@@ -99,6 +122,7 @@ def solve_current_with_sag(p_elec_w: float, soc: float) -> Tuple[float,float]:
     return V, I
 
 def battery_hover_power_kW(soc: float, rho: float) -> Tuple[float,float,float]:
+    # ↑ Hover electrical power for battery config at current SoC and density
     p_mech = hover_mech_power_disk(DRONE_MASS_BATT_KG, rho)
     p_elec = p_mech / max(1e-6, ETA_TOTAL)
     if PER_MOTOR_POWER_CAP_W is not None:
@@ -123,10 +147,10 @@ class BatterySim:
     time_s: float = 0.0
 
 # -------- Hybrid model --------
-GEN_CONT_KW, GEN_MASS_KG = 14.0, 29.5
-SFC_KG_PER_KWH, FUEL_DENSITY_KG_PER_L = 0.600, 0.74
-HOVER_BURN_LPH_FIXED, USE_FIXED_HOVER_BURN = 12.5, False
-BASE_AIRFRAME_MASS_KG, FUEL_TANK_L = 50.5, 15.0
+GEN_CONT_KW, GEN_MASS_KG = 14.0, 29.5   # ↑ Generator continuous kW and its mass
+SFC_KG_PER_KWH, FUEL_DENSITY_KG_PER_L = 0.600, 0.74  # ↑ Specific fuel consumption & density
+HOVER_BURN_LPH_FIXED, USE_FIXED_HOVER_BURN = 12.5, False  # ↑ Use fixed L/h if True
+BASE_AIRFRAME_MASS_KG, FUEL_TANK_L = 50.5, 15.0            # ↑ Airframe mass (no gen) and tank size
 
 def fuel_burn_lph_from_power(power_kW: float) -> float:
     return (power_kW * SFC_KG_PER_KWH) / max(1e-6, FUEL_DENSITY_KG_PER_L)
@@ -202,6 +226,7 @@ async def arm_takeoff(drone: System, alt: float):
         if pos.relative_altitude_m >= alt-0.5 or time.time()-t0 > 12: break
 
 async def start_offboard_with_zero(drone: System):
+    # ↑ Fixes NO_SETPOINT_SET: send an initial setpoint before OFFBOARD start
     zero = VelocityNedYaw(0.0,0.0,0.0,0.0)
     await drone.offboard.set_velocity_ned(zero); await asyncio.sleep(0.05)
     try: await drone.offboard.start()
@@ -276,6 +301,7 @@ async def wind_driver(weather: Weather, stop: asyncio.Event, logger: Optional[Cs
         logger.event(mode, weather.wind_mode, weather.wind_speed_mps, weather.wind_dir_deg,
                      0.0, "wind_config_selected")
     if weather.wind_mode == "ideal":
+        # ↑ Ideal = always 0 m/s wind
         weather.wind_speed_mps = 0.0
         weather.wind_dir_deg   = 0.0
         weather.gust_expire_ts = 0.0
@@ -285,6 +311,7 @@ async def wind_driver(weather: Weather, stop: asyncio.Event, logger: Optional[Cs
     while not stop.is_set():
         now = time.time()
         if last_change < 0 or (now - last_change) >= WIND_UPDATE_PERIOD_S:
+            # ↑ Change wind every WIND_UPDATE_PERIOD_S; range [0..WIND_RANDOM_MAX_MPS]
             last_change = now
             weather.wind_speed_mps = random.uniform(0.0, WIND_RANDOM_MAX_MPS)
             weather.wind_dir_deg   = random.uniform(0.0, 360.0)
@@ -310,8 +337,11 @@ async def battery_sim_updater(sim: BatterySim, weather: Weather,
 
         if bool(st.in_air):
             base_kw, v, i = battery_hover_power_kW(sim.soc, weather.rho)
+            # ↑ Tilt multiplier makes power rise when pitched/rolled (to hold altitude)
             tilt_mult = 1.0 / max(1e-3, math.cos(st.roll_rad)*math.cos(st.pitch_rad))
+            # ↑ Extra draw when you command XY motion (tilt proxy)
             vel_extra = 1.0 + K_VEL_POWER * min(5.0, horiz_mag_ref.get("mag_xy",0.0))
+            # ↑ Extra draw for ambient wind
             wind_mult = 1.0 + WIND_POWER_PER_MPS * max(0.0, weather.wind_speed_mps)
             p_kw = base_kw * tilt_mult * vel_extra * wind_mult
         else:
@@ -355,6 +385,7 @@ async def hybrid_updater(h: HybridState, weather: Weather,
         dt_sim = max(0.0, (now-last)) * SPEED_FACTOR
         last = now; h.time_s += dt_sim
 
+        # Mass reduces as fuel burns (small effect on hover power)
         fuel_mass = h.fuel_L * FUEL_DENSITY_KG_PER_L
         mass = BASE_AIRFRAME_MASS_KG + GEN_MASS_KG + fuel_mass
         p_hover = hover_electrical_kW(mass, weather.rho)
@@ -384,6 +415,7 @@ async def csv_periodic_logger(mode: str, logger: CsvLogger, log_period_s: float,
                               st: TelemetryState, battery_sim: Optional[BatterySim],
                               hstate: Optional[HybridState], horiz_mag_ref: dict,
                               stop: asyncio.Event, weather: Weather):
+    # ↑ log_period_s controls CSV sample rate in *sim* seconds
     last_written = -1.0
     while not stop.is_set():
         try:
@@ -485,7 +517,7 @@ async def teleop(mode: str, port: int, weather: Weather, log_path: str, log_peri
                 dt_loop = max(1e-3, now - last_loop)
                 last_loop = now
 
-                # integrate rough local position
+                # integrate rough local position (from NED velocity)
                 st.pos_n += st.vel_n * dt_loop
                 st.pos_e += st.vel_e * dt_loop
 
@@ -496,8 +528,8 @@ async def teleop(mode: str, port: int, weather: Weather, log_path: str, log_peri
                     elif k=='s': vx -= VEL_STEP_MS
                     elif k=='d': vy += VEL_STEP_MS
                     elif k=='a': vy -= VEL_STEP_MS
-                    elif k=='r': vz -= VEL_STEP_UP_MS
-                    elif k=='f': vz += VEL_STEP_UP_MS
+                    elif k=='r': vz -= VEL_STEP_UP_MS   # NED: up = negative down
+                    elif k=='f': vz += VEL_STEP_UP_MS   # NED: down = positive
                     elif k=='j': yaw_rate -= YAW_STEP_DEG_S
                     elif k=='l': yaw_rate += YAW_STEP_DEG_S
                     elif k==' ':
@@ -590,7 +622,7 @@ def prompt_mode() -> str:
         print("Please type 'battery' or 'hybrid'.")
 
 def prompt_wind() -> Weather:
-    rho = isa_density(15.0, 0.0)  # ISA SL
+    rho = isa_density(15.0, 0.0)  # ↑ Change temp/alt if you want non-ISA density
     s = input("Wind mode [ideal/random] (default ideal): ").strip().lower()
     if s in ("r","random"):
         speed = random.uniform(0.0, WIND_RANDOM_MAX_MPS)
