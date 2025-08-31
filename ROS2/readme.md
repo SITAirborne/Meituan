@@ -119,8 +119,9 @@ ros2 topic echo /mavros/state --once   # expect: connected: true
 
 ### Terminal #3 – Teleop node
 ```bash
+cd (into scripts)
 source /opt/ros/jazzy/setup.bash
-python3 teleop_ros2_jazzy.py
+python3 teleop.py
 ```
 Prompts:
 - System: `battery` or `hybrid`
